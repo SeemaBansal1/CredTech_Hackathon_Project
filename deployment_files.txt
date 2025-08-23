@@ -1,0 +1,526 @@
+# backend/Dockerfile
+FROM python:3.11-slim
+
+# Set work directory
+WORKDIR /app
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+
+# Install system dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        git \
+        libpq-dev \
+        && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Download spaCy model
+RUN python -m spacy download en_core_web_sm
+
+# Copy project
+COPY . .
+
+# Create directories
+RUN mkdir -p /app/models /app/data /app/logs
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run the application
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+---
+# frontend/Dockerfile
+FROM node:18-alpine
+
+# Set working directory
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm ci --only=production
+
+# Copy source code
+COPY . .
+
+# Build application
+RUN npm run build
+
+# Use nginx to serve the built app
+FROM nginx:alpine
+COPY --from=0 /app/build /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/nginx.conf
+
+EXPOSE 3000
+
+CMD ["nginx", "-g", "daemon off;"]
+
+---
+# .env.example
+# Environment Configuration
+
+# Application
+APP_NAME=CredScope AI
+APP_VERSION=1.0.0
+ENV=development
+DEBUG=true
+SECRET_KEY=your-secret-key-here
+
+# Database Configuration
+DATABASE_URL=postgresql://credscope_user:credscope_pass@localhost:5432/credscope
+REDIS_URL=redis://:credscope_redis_pass@localhost:6379/0
+CLICKHOUSE_URL=http://localhost:8123
+
+# Message Queue
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+KAFKA_TOPIC_SCORES=credit_scores
+KAFKA_TOPIC_NEWS=news_events
+KAFKA_TOPIC_ALERTS=alerts
+
+# External APIs
+YAHOO_FINANCE_API_KEY=your_yahoo_finance_key
+NEWS_API_KEY=your_news_api_key
+FRED_API_KEY=your_fred_api_key
+TWITTER_BEARER_TOKEN=your_twitter_bearer_token
+
+# ML Configuration
+MODEL_UPDATE_FREQUENCY=3600
+BATCH_SIZE=32
+LEARNING_RATE=0.001
+MODEL_VALIDATION_SPLIT=0.2
+
+# Security
+CORS_ORIGINS=["http://localhost:3000","https://credscope.ai"]
+JWT_SECRET_KEY=your_jwt_secret
+JWT_ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+
+# Monitoring
+ENABLE_METRICS=true
+METRICS_PORT=9091
+LOG_LEVEL=INFO
+
+---
+# nginx/nginx.conf
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream api {
+        server api:8000;
+    }
+
+    upstream frontend {
+        server frontend:3000;
+    }
+
+    # Rate limiting
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=general:10m rate=1r/s;
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        # Security headers
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer-when-downgrade" always;
+        add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;
+
+        # Frontend routes
+        location / {
+            proxy_pass http://frontend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # API routes
+        location /api/ {
+            limit_req zone=api_limit burst=20 nodelay;
+            
+            proxy_pass http://api/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # CORS headers
+            add_header Access-Control-Allow-Origin *;
+            add_header Access-Control-Allow-Methods "GET, POST, OPTIONS, PUT, DELETE";
+            add_header Access-Control-Allow-Headers "DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range";
+        }
+
+        # WebSocket support
+        location /ws/ {
+            proxy_pass http://api/ws/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Health checks
+        location /health {
+            proxy_pass http://api/health;
+            access_log off;
+        }
+
+        # Static files with caching
+        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+    }
+}
+
+---
+# kubernetes/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: credscope-ai
+  labels:
+    name: credscope-ai
+
+---
+# kubernetes/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: credscope-config
+  namespace: credscope-ai
+data:
+  APP_NAME: "CredScope AI"
+  ENV: "production"
+  LOG_LEVEL: "INFO"
+  CORS_ORIGINS: '["https://credscope.ai"]'
+  MODEL_UPDATE_FREQUENCY: "3600"
+  BATCH_SIZE: "32"
+  ENABLE_METRICS: "true"
+
+---
+# kubernetes/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: credscope-secrets
+  namespace: credscope-ai
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql://user:pass@postgres:5432/credscope"
+  REDIS_URL: "redis://:pass@redis:6379/0"
+  SECRET_KEY: "your-secret-key"
+  JWT_SECRET_KEY: "your-jwt-secret"
+  YAHOO_FINANCE_API_KEY: "your-api-key"
+  NEWS_API_KEY: "your-news-api-key"
+
+---
+# kubernetes/deployment-api.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: credscope-api
+  namespace: credscope-ai
+  labels:
+    app: credscope-api
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: credscope-api
+  template:
+    metadata:
+      labels:
+        app: credscope-api
+    spec:
+      containers:
+      - name: api
+        image: credscope-ai:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: credscope-secrets
+              key: DATABASE_URL
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: credscope-secrets
+              key: REDIS_URL
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: credscope-secrets
+              key: SECRET_KEY
+        envFrom:
+        - configMapRef:
+            name: credscope-config
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: models-storage
+          mountPath: /app/models
+      volumes:
+      - name: models-storage
+        persistentVolumeClaim:
+          claimName: models-pvc
+
+---
+# kubernetes/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: credscope-api-service
+  namespace: credscope-ai
+spec:
+  selector:
+    app: credscope-api
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: LoadBalancer
+
+---
+# kubernetes/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: credscope-ingress
+  namespace: credscope-ai
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+spec:
+  tls:
+  - hosts:
+    - credscope.ai
+    - api.credscope.ai
+    secretName: credscope-tls
+  rules:
+  - host: credscope.ai
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: credscope-frontend-service
+            port:
+              number: 80
+  - host: api.credscope.ai
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: credscope-api-service
+            port:
+              number: 80
+
+---
+# monitoring/prometheus/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alerts.yml"
+
+scrape_configs:
+  - job_name: 'credscope-api'
+    static_configs:
+      - targets: ['api:8000']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+  - job_name: 'postgres-exporter'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  - job_name: 'redis-exporter'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  - job_name: 'kafka-exporter'
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+---
+# .github/workflows/ci-cd.yml
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: credscope-ai
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.9, 3.10, 3.11]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r backend/requirements.txt
+        python -m spacy download en_core_web_sm
+    
+    - name: Run tests
+      run: |
+        cd backend
+        python -m pytest tests/ -v --cov=./ --cov-report=xml
+    
+    - name: Upload coverage
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./backend/coverage.xml
+
+  frontend-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+    
+    - name: Install dependencies
+      run: |
+        cd frontend
+        npm ci
+    
+    - name: Run tests
+      run: |
+        cd frontend
+        npm test -- --coverage --watchAll=false
+    
+    - name: Build frontend
+      run: |
+        cd frontend
+        npm run build
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+  build-and-deploy:
+    needs: [test, frontend-test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Build and push Docker images
+      run: |
+        docker build -t ${{ env.REGISTRY }}/${{ github.repository }}/backend:${{ github.sha }} ./backend
+        docker build -t ${{ env.REGISTRY }}/${{ github.repository }}/frontend:${{ github.sha }} ./frontend
+        
+        docker push ${{ env.REGISTRY }}/${{ github.repository }}/backend:${{ github.sha }}
+        docker push ${{ env.REGISTRY }}/${{ github.repository }}/frontend:${{ github.sha }}
+    
+    - name: Deploy to Kubernetes
+      uses: azure/k8s-deploy@v1
+      with:
+        manifests: |
+          kubernetes/deployment-api.yaml
+          kubernetes/deployment-frontend.yaml
+          kubernetes/service.yaml
+          kubernetes/ingress.yaml
+        images: |
+          ${{ env.REGISTRY }}/${{ github.repository }}/backend:${{ github.sha }}
+          ${{ env.REGISTRY }}/${{ github.repository }}/frontend:${{ github.sha }}
+        kubectl-version: 'latest'
